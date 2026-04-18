@@ -1,0 +1,9 @@
+{
+  "name": "ConstruxTrack",
+  "description": "Mobile-first construction site tracking app for attendance (selfie + GPS), project progress, and material monitoring.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": []
+}

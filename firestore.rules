@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isEmailVerified() { return request.auth.token.email_verified == true; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // Identity Check
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    
+    // Role Check - Requires a DB read
+    function isAdmin() { 
+      return isSignedIn() && isEmailVerified() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // --- Validation Helpers ---
+    
+    function isValidUser(data) {
+      return data.uid == request.auth.uid
+        && data.email is string && data.email.size() <= 100
+        && data.role in ['admin', 'contractor']
+        && (!('company' in data) || data.company is string && data.company.size() <= 100)
+        && data.keys().hasAll(['uid', 'email', 'role'])
+        && data.keys().size() >= 3;
+    }
+
+    function isValidProject(data) {
+      return data.name is string && data.name.size() <= 100
+        && data.status in ['planned', 'in-progress', 'completed']
+        && data.keys().hasAll(['name', 'status']);
+    }
+
+    function isValidAttendance(data) {
+      return data.userId == request.auth.uid
+        && data.projectId is string && isValidId(data.projectId)
+        && data.timestamp == request.time
+        && data.selfieUrl is string && data.selfieUrl.size() <= 1000
+        && data.latitude is number && data.longitude is number
+        && data.keys().hasAll(['userId', 'projectId', 'timestamp', 'selfieUrl', 'latitude', 'longitude'])
+        && data.keys().size() == 6;
+    }
+
+    function isValidReport(data) {
+      return data.projectId is string && isValidId(data.projectId)
+        && data.reporterId == request.auth.uid
+        && data.timestamp == request.time
+        && data.percentageDone is number && data.percentageDone >= 0 && data.percentageDone <= 100
+        && (!('description' in data) || data.description is string && data.description.size() <= 2000)
+        && data.keys().hasAll(['projectId', 'reporterId', 'timestamp', 'percentageDone']);
+    }
+
+    // --- Collection Rules ---
+
+    // 1. Users Collection
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin(); // Only admins can list all users
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && isValidUser(incoming()) && (
+        // Prevent role escalation: contractors cannot change their own role
+        (existing().role == 'contractor' && incoming().role == 'contractor' && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'company', 'contactInfo'])) ||
+        // Admins can change anything via a separate block or if they are the owner
+        (existing().role == 'admin')
+      );
+    }
+
+    // 2. Projects Collection
+    match /projects/{projectId} {
+      allow read: if isSignedIn();
+      allow create: if isAdmin() && isValidProject(incoming());
+      allow update: if (isAdmin() || (isSignedIn() && isEmailVerified())) && isValidProject(incoming()) && (
+        // Admins can do full updates
+        isAdmin() ||
+        // Only allow status updates for verified contractors if needed, but per request,
+        // project progress is usually reported in subcollections.
+        // Let's keep main project document admin-only for changes unless it's weather.
+        incoming().diff(existing()).affectedKeys().hasOnly(['weather', 'status'])
+      );
+      
+      // Reports Subcollection
+      match /reports/{reportId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && isEmailVerified() && isValidReport(incoming()) && 
+                       exists(/databases/$(database)/documents/projects/$(projectId));
+        allow update: if false; // Reports represent history, immutable.
+        allow delete: if isAdmin();
+      }
+    }
+
+    // 3. Attendance Collection
+    match /attendance/{attendanceId} {
+      allow get: if isOwner(resource.data.userId) || isAdmin();
+      allow list: if (isSignedIn() && resource.data.userId == request.auth.uid) || isAdmin();
+      allow create: if isSignedIn() && isEmailVerified() && isValidAttendance(incoming()) &&
+                       exists(/databases/$(database)/documents/projects/$(incoming().projectId));
+      allow update, delete: if false; // Attendance is a permanent record
+    }
+  }
+}
